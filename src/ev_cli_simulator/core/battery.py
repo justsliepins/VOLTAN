@@ -2,7 +2,7 @@ class Battery:
     """
     Models the physical state of an EV battery, tracking its state of charge (SOC).
     """
-    def __init__(self, capacity_kwh: float, initial_soc: float = 0.0):
+    def __init__(self, capacity_kwh: float, initial_soc: float = 0.0, initial_soh: float =  1.0):
         """
         Initializes the Battery.
 
@@ -12,6 +12,7 @@ class Battery:
         """
         self.capacity_kwh = float(capacity_kwh)
         self.soc = max(0.0, min(1.0, float(initial_soc)))
+        self.soh = max(0.0, min(1.0, float(initial_soh)))
 
     def update_soc(self, power_kw: float, duration_h: float):
         """

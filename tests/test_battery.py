@@ -22,3 +22,14 @@ def test_update_soc(power_kw, duration_h, expected_soc):
     battery = Battery(capacity_kwh=77.0, initial_soc=0.5)
     battery.update_soc(power_kw, duration_h)
     assert battery.soc == pytest.approx(expected_soc, abs=1e-4)
+
+def test_battery_initialization_with_soh():
+    """Tests if the battery initializes with correct SOH."""
+    # Test default SOH
+    battery1 = Battery(capacity_kwh=77.0)
+    assert battery1.soh == 1.0
+
+    # Test specific SOH
+    battery2 = Battery(capacity_kwh=77.0, initial_soh=0.9)
+    assert battery2.soh == 0.9
+
