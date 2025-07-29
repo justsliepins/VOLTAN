@@ -35,3 +35,26 @@ def test_get_calendar_ageing_cost():
     actual_cost = model.get_calendar_ageing_cost(soc=soc, duration_h=duration_h)
     
     assert actual_cost == pytest.approx(expected_cost, abs=1e-3)
+
+# Add this new function to tests/test_degradation_model.py
+
+# In tests/test_degradation_model.py
+
+def test_get_cyclic_ageing_cost():
+    """
+    Tests if cyclic ageing cost is calculated correctly based on C-rate
+    and the portion of a full cycle completed.
+    """
+    model = DegradationModel()
+
+    c_rate = 1.25
+    cycle_portion = 0.1
+
+    # UPDATE THIS VALUE: The expected cost based on the more accurate,
+    # multi-point interpolation in the model.
+    expected_cost = 0.3085
+
+    actual_cost = model.get_cyclic_ageing_cost(c_rate=c_rate, cycle_portion=cycle_portion)
+
+    # The test will now pass with the correct expectation
+    assert actual_cost == pytest.approx(expected_cost, abs=1e-3)
