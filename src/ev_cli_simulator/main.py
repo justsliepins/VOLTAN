@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 # Import all our components
 from .cli_parser import parse_args
-from .config_manager import ConfigManager, ScenarioConfig, AgentConfig
+from .config_manager import ConfigManager, AgentConfig, ScenarioConfig
 from .agent_loader import load_agent
 from .data_logger import DataLogger
 from .core.battery import Battery
@@ -29,7 +29,6 @@ class DumbAgent:
 def run_simulation_run(config, agents_to_run: dict, logger, engine_override=None):
     """Executes a single, full simulation run for multiple agents."""
     
-    # Create a separate battery and engine for each agent
     batteries = {name: Battery(config['battery_capacity']) for name in agents_to_run}
     engines = {}
     
@@ -51,19 +50,15 @@ def run_simulation_run(config, agents_to_run: dict, logger, engine_override=None
     scenario_choices = [s for s in scenarios]
     scenario_probabilities = [s.probability for s in scenarios]
     
-    # Track cycles for each agent
     kwh_charged = {name: 0 for name in agents_to_run}
     cycle_counts = {name: 1 for name in agents_to_run}
 
     for day in range(num_days):
         daily_scenario = random.choices(scenario_choices, scenario_probabilities)[0]
         
-        # Reset SOC for all batteries at the start of the day
         for battery in batteries.values():
             battery.soc = config['start_soc']
         
-        daily_log_buffer = []
-
         for step in range(96):
             timestamp = datetime(2025, 1, 1, tzinfo=latvia_tz) + timedelta(days=day, minutes=15*step)
             current_hour = timestamp.hour
@@ -76,7 +71,6 @@ def run_simulation_run(config, agents_to_run: dict, logger, engine_override=None
                 if start <= current_hour < end: in_window = True
 
             if in_window:
-                # Loop through each agent and simulate its step
                 for name, agent in agents_to_run.items():
                     battery = batteries[name]
                     engine = engines[name]
@@ -85,7 +79,7 @@ def run_simulation_run(config, agents_to_run: dict, logger, engine_override=None
                     
                     if isinstance(agent, DumbAgent):
                         action_index, _ = agent.predict(obs, config['charger_power_levels'], config['soc_target'])
-                    else: # Smart Agent
+                    else:
                         action_index, _ = agent.predict(obs)
 
                     if action_index >= len(config['charger_power_levels']):
@@ -96,27 +90,26 @@ def run_simulation_run(config, agents_to_run: dict, logger, engine_override=None
 
                     results = engine.run_step(power_kw, 0.25, timestamp, cycle_counts[name])
                     
-                    daily_log_buffer.append({
-                        'agent_type': name, 'timestamp': timestamp,
-                        'charging_scenario': daily_scenario.name, 'power_kw': power_kw,
-                        **results['costs'], 'soc': results['final_soc'], 'soh': results['final_soh']
-                    })
+                    # **FIX: Log every step directly and explicitly**
+                    soc_fulfillment = battery.soc / config['soc_target']
+                    logger.log_step(
+                        run_id=config['run_id'], day=day, timestamp=timestamp,
+                        agent_type=name, charging_scenario=daily_scenario.name,
+                        power_kw=power_kw,
+                        electricity_cost=results['costs']['electricity_cost'],
+                        calendar_cost=results['costs']['calendar_cost'],
+                        cyclic_cost=results['costs']['cyclic_cost'],
+                        total_cost=results['costs']['total_cost'],
+                        soc=results['final_soc'],
+                        soh=results['final_soh'],
+                        soc_fulfillment=soc_fulfillment
+                    )
                     
                     if power_kw > 0:
                         kwh_charged[name] += power_kw * 0.25
                     if kwh_charged[name] >= config['battery_capacity']:
                         cycle_counts[name] += 1
                         kwh_charged[name] = 0
-        
-        # After the day, calculate fulfillment and log all buffered steps
-        for entry in daily_log_buffer:
-            agent_name = entry['agent_type']
-            final_soc_for_day = batteries[agent_name].soc
-            fulfillment = final_soc_for_day / config['soc_target']
-            logger.log_step(
-                run_id=config['run_id'], day=day,
-                soc_fulfillment=fulfillment, **entry
-            )
 
 def main():
     """Main entry point for the CLI application."""
@@ -127,7 +120,6 @@ def main():
     scenarios = config_manager.parse_scenarios(raw_args.scenarios)
     agent_configs = config_manager.parse_agents(raw_args.agents)
     
-    # Load all agents into a dictionary
     agents_to_run = {}
     for agent_config in agent_configs:
         if agent_config.path == 'baseline':
