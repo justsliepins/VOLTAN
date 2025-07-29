@@ -16,7 +16,8 @@ class MockDegradationModel:
 @pytest.fixture
 def calculator_setup():
     """Sets up the PriceModel, mock DegradationModel, and CostCalculator."""
-    csv_data = "timestamp,price_eur_per_kwh\n2025-01-01T10:00:00Z,0.15"
+    # **FIX: Use the correct column headers 'ts_start' and 'price'**
+    csv_data = "ts_start,price\n2025-01-01T10:00:00Z,0.15"
     price_model = PriceModel(csv_data)
     degradation_model = MockDegradationModel()
     cost_calculator = CostCalculator(

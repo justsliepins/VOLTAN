@@ -23,6 +23,15 @@ def parse_args(args_list: Optional[List[str]] = None):
     )
 
     # --- Required Arguments ---
+    # Add this block to your cli_parser.py file
+
+    parser.add_argument(
+        "--price-path",
+        type=str,
+        required=True,
+        help="File path to the CSV file containing historical price data."
+    )
+    
     parser.add_argument(
         "--agent-path",
         type=str,
