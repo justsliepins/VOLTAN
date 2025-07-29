@@ -19,20 +19,17 @@ from .core.simulation_engine import SimulationEngine
 # A simple baseline agent for comparison
 class DumbAgent:
     def predict(self, obs, charger_config: ChargerConfig, target_soc: float, deterministic=True):
-        """
-        A simple baseline agent that charges at max power if below target SOC.
-        """
         soc = obs[0]
         max_power = max(charger_config.power_levels)
         max_power_index = charger_config.power_levels.index(max_power)
         idle_power_index = charger_config.power_levels.index(0) if 0 in charger_config.power_levels else 0
-        # **FIX: Use the dynamic target_soc**
         action_index = max_power_index if soc < target_soc else idle_power_index
         return (action_index, None)
 
 def run_simulation_run(config, smart_agent, logger, engine_override=None):
     """Executes a single, full simulation run from start to finish."""
     
+    # These batteries persist for the entire multi-year run
     smart_battery = Battery(config['battery_capacity'])
     dumb_battery = Battery(config['battery_capacity'])
     
@@ -70,11 +67,12 @@ def run_simulation_run(config, smart_agent, logger, engine_override=None):
         
         daily_scenario = random.choices(scenario_choices, scenario_probabilities)[0]
         
-        # **NEW: Variables to track end-of-window state and daily costs**
-        smart_soc_end_of_window = None
-        dumb_soc_end_of_window = None
-        daily_smart_costs = {}
-        daily_dumb_costs = {}
+        # Simulate daily driving by resetting SOC at the start of each day.
+        start_of_day_soc = 0.3
+        smart_battery.soc = start_of_day_soc
+        dumb_battery.soc = start_of_day_soc
+        
+        daily_log_buffer = []
 
         for step in range(96):
             timestamp = datetime(2025, 1, 1, tzinfo=latvia_tz) + timedelta(days=day, minutes=15*step)
@@ -102,9 +100,11 @@ def run_simulation_run(config, smart_agent, logger, engine_override=None):
 
                 results = smart_engine.run_step(power_kw, 0.25, timestamp, smart_cycle_count)
                 
-                # Accumulate daily costs
-                for key, value in results['costs'].items():
-                    daily_smart_costs[key] = daily_smart_costs.get(key, 0) + value
+                daily_log_buffer.append({
+                    'agent_type': 'Smart', 'timestamp': timestamp,
+                    'charging_scenario': daily_scenario.name, 'power_kw': power_kw,
+                    **results['costs'], 'soc': results['final_soc'], 'soh': results['final_soh']
+                })
                 
                 if power_kw > 0:
                     smart_kwh_charged += power_kw * 0.25
@@ -121,44 +121,32 @@ def run_simulation_run(config, smart_agent, logger, engine_override=None):
 
                 results_dumb = dumb_engine.run_step(power_kw_dumb, 0.25, timestamp, dumb_cycle_count)
 
-                for key, value in results_dumb['costs'].items():
-                    daily_dumb_costs[key] = daily_dumb_costs.get(key, 0) + value
+                daily_log_buffer.append({
+                    'agent_type': 'Dumb', 'timestamp': timestamp,
+                    'charging_scenario': daily_scenario.name, 'power_kw': power_kw_dumb,
+                    **results_dumb['costs'], 'soc': results_dumb['final_soc'], 'soh': results_dumb['final_soh']
+                })
 
                 if power_kw_dumb > 0:
                     dumb_kwh_charged += power_kw_dumb * 0.25
                 if dumb_kwh_charged >= config['battery_capacity']:
                     dumb_cycle_count += 1
                     dumb_kwh_charged = 0
-            
-            # Capture the SOC at the moment the window closes
-            if not in_window and smart_soc_end_of_window is None and step > 0:
-                smart_soc_end_of_window = smart_battery.soc
-                dumb_soc_end_of_window = dumb_battery.soc
         
-        # Log the daily summary
-        if smart_soc_end_of_window is None: # Handle cases where window is 24h
-            smart_soc_end_of_window = smart_battery.soc
-            dumb_soc_end_of_window = dumb_battery.soc
-            
-        logger.log_step(
-            run_id=config['run_id'], 
-            day=day, 
-            agent_type='Smart', 
-            final_soc=smart_soc_end_of_window,
-            final_soh=smart_battery.soh,
-            soc_fulfillment=smart_soc_end_of_window / config['soc_target'],
-            **daily_smart_costs
-        )
-        logger.log_step(
-            run_id=config['run_id'], 
-            day=day, 
-            agent_type='Dumb', 
-            final_soc=dumb_soc_end_of_window,
-            final_soh=dumb_battery.soh,
-            soc_fulfillment=dumb_soc_end_of_window / config['soc_target'],
-            **daily_dumb_costs
-        )
+        smart_soc_end_of_day = smart_battery.soc
+        dumb_soc_end_of_day = dumb_battery.soc
+        
+        smart_fulfillment = smart_soc_end_of_day / config['soc_target']
+        dumb_fulfillment = dumb_soc_end_of_day / config['soc_target']
 
+        for entry in daily_log_buffer:
+            fulfillment = smart_fulfillment if entry['agent_type'] == 'Smart' else dumb_fulfillment
+            logger.log_step(
+                run_id=config['run_id'],
+                day=day,
+                soc_fulfillment=fulfillment,
+                **entry
+            )
 
 def main():
     """Main entry point for the CLI application."""
@@ -183,14 +171,11 @@ def main():
     for i in range(raw_args.runs):
         print(f"--- Starting Simulation Run {i+1} of {raw_args.runs} ---")
         config = {
-            'run_id': i + 1,
-            'years': raw_args.years,
+            'run_id': i + 1, 'years': raw_args.years,
             'battery_capacity': raw_args.battery_capacity,
             'max_charge_speed': raw_args.max_charge_speed,
-            'chargers': chargers,
-            'price_path': raw_args.price_path,
-            'scenarios': scenarios,
-            'soc_target': raw_args.soc_target # **NEW: Add soc_target to config**
+            'chargers': chargers, 'price_path': raw_args.price_path,
+            'scenarios': scenarios, 'soc_target': raw_args.soc_target
         }
         run_simulation_run(config, smart_agent, full_log)
 
