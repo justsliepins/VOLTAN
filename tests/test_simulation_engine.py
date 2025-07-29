@@ -13,7 +13,7 @@ class MockCostCalculator:
             "electricity_cost": 1.65,
             "calendar_cost": 0.1,
             "cyclic_cost": 0.3,
-            "total_cost": 2.05,
+            "total_cost": 2.05, # This is now irrelevant for SOH calculation
         }
 
 # --- The Actual Test ---
@@ -45,7 +45,13 @@ def test_run_step():
     # 3. Assertions
     # Assert battery state was updated correctly
     assert battery.soc == pytest.approx(0.6428, abs=1e-4)
-    assert battery.soh == pytest.approx(0.99994875)
+
+    # **FIX: Update the expected SOH calculation to match the new logic.**
+    # The physical degradation is now only calendar + cyclic cost.
+    # physical_cost = 0.1 + 0.3 = 0.4
+    # soh_loss = (0.4 / 8000) * 0.20 = 0.00001
+    # new_soh = 1.0 - 0.00001 = 0.99999
+    assert battery.soh == pytest.approx(0.99999)
 
     # Assert the returned dictionary has the correct information
     assert step_results['final_soc'] == battery.soc

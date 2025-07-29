@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import dataclass
 from typing import List
 
@@ -9,6 +10,15 @@ class ChargerConfig:
     power_levels: List[int]
     start_hour: int
     end_hour: int
+
+@dataclass
+class ScenarioConfig:
+    """A structured representation of a daily charging scenario."""
+    name: str
+    start_hour: int
+    end_hour: int
+    probability: float
+
 
 class ConfigManager:
     """
@@ -59,3 +69,50 @@ class ConfigManager:
                                  f"Expected 'Name:[p1,p2]:start-end'. Error: {e}")
         
         return parsed_chargers
+
+    def parse_scenarios(self, scenario_strings: List[str]) -> List[ScenarioConfig]:
+        """
+        Parses a list of raw scenario definition strings into a list of
+        structured ScenarioConfig objects.
+
+        Also validates that the sum of all probabilities is 1.0.
+
+        Args:
+            scenario_strings (List[str]): e.g., ['Workday:19-07:0.8'].
+
+        Returns:
+            List[ScenarioConfig]: A list of validated ScenarioConfig objects.
+        
+        Raises:
+            ValueError: If a string has an invalid format or if probabilities
+                        do not sum to 1.0.
+        """
+        parsed_scenarios = []
+        total_prob = 0.0
+        for scenario_str in scenario_strings:
+            try:
+                name, time_str, prob_str = scenario_str.split(':')
+                
+                start_hour_str, end_hour_str = time_str.split('-')
+                start_hour = int(start_hour_str)
+                end_hour = int(end_hour_str)
+                
+                probability = float(prob_str)
+                total_prob += probability
+                
+                config = ScenarioConfig(
+                    name=name,
+                    start_hour=start_hour,
+                    end_hour=end_hour,
+                    probability=probability
+                )
+                parsed_scenarios.append(config)
+
+            except ValueError as e:
+                raise ValueError(f"Invalid scenario format: '{scenario_str}'. Error: {e}")
+        
+        # Validate that probabilities sum to 1.0 (with a small tolerance for float errors)
+        if not math.isclose(total_prob, 1.0):
+            raise ValueError(f"Probabilities must sum to 1.0, but got {total_prob}")
+            
+        return parsed_scenarios

@@ -46,7 +46,6 @@ class SimulationEngine:
             dict: A dictionary containing the detailed results of the step,
                   including costs and the final battery state.
         """
-        # Get the state of the battery *before* the step begins
         initial_soc = self.battery.soc
         
         # 1. Calculate all costs for the proposed action
@@ -58,11 +57,13 @@ class SimulationEngine:
             soc=initial_soc,
             cycle_number=cycle_number
         )
-        total_cost = costs['total_cost']
+        
+        # **FIX: Calculate physical degradation cost separately from economic cost.**
+        # The SOH loss should only be based on the physical stress to the battery.
+        physical_degradation_cost = costs['calendar_cost'] + costs['cyclic_cost']
 
-        # 2. Convert the monetary cost to physical SOH loss
-        # The formula is: (cost_of_this_step / total_cost_to_eol) * total_soh_loss_at_eol
-        soh_loss = (total_cost / self.battery_eol_cost) * self.EOL_SOH_LOSS
+        # 2. Convert the physical degradation cost to physical SOH loss
+        soh_loss = (physical_degradation_cost / self.battery_eol_cost) * self.EOL_SOH_LOSS
 
         # 3. Update the battery's state
         self.battery.update_soc(power_kw, duration_h)

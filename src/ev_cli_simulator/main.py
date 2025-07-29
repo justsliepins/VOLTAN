@@ -1,13 +1,13 @@
 import os
 import random
 import pandas as pd
-import numpy as np  # Import numpy
+import numpy as np
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Import all our components
 from .cli_parser import parse_args
-from .config_manager import ConfigManager, ChargerConfig
+from .config_manager import ConfigManager, ChargerConfig, ScenarioConfig
 from .agent_loader import load_agent
 from .data_logger import DataLogger
 from .core.battery import Battery
@@ -18,12 +18,16 @@ from .core.simulation_engine import SimulationEngine
 
 # A simple baseline agent for comparison
 class DumbAgent:
-    def predict(self, obs, charger_config: ChargerConfig, deterministic=True):
+    def predict(self, obs, charger_config: ChargerConfig, target_soc: float, deterministic=True):
+        """
+        A simple baseline agent that charges at max power if below target SOC.
+        """
         soc = obs[0]
         max_power = max(charger_config.power_levels)
         max_power_index = charger_config.power_levels.index(max_power)
         idle_power_index = charger_config.power_levels.index(0) if 0 in charger_config.power_levels else 0
-        action_index = max_power_index if soc < 0.9 else idle_power_index
+        # **FIX: Use the dynamic target_soc**
+        action_index = max_power_index if soc < target_soc else idle_power_index
         return (action_index, None)
 
 def run_simulation_run(config, smart_agent, logger, engine_override=None):
@@ -50,61 +54,111 @@ def run_simulation_run(config, smart_agent, logger, engine_override=None):
     
     num_days = int(config['years'] * 365)
     
+    scenarios = config['scenarios']
+    scenario_choices = [s for s in scenarios]
+    scenario_probabilities = [s.probability for s in scenarios]
+    
     smart_kwh_charged = 0
     dumb_kwh_charged = 0
     smart_cycle_count = 1
     dumb_cycle_count = 1
 
     for day in range(num_days):
+        if not config['chargers']:
+            raise ValueError("Configuration error: At least one charger must be provided.")
         charger = random.choice(config['chargers'])
         
+        daily_scenario = random.choices(scenario_choices, scenario_probabilities)[0]
+        
+        # **NEW: Variables to track end-of-window state and daily costs**
+        smart_soc_end_of_window = None
+        dumb_soc_end_of_window = None
+        daily_smart_costs = {}
+        daily_dumb_costs = {}
+
         for step in range(96):
             timestamp = datetime(2025, 1, 1, tzinfo=latvia_tz) + timedelta(days=day, minutes=15*step)
+            current_hour = timestamp.hour
+
+            in_window = False
+            start, end = daily_scenario.start_hour, daily_scenario.end_hour
+            if start > end:
+                if current_hour >= start or current_hour < end:
+                    in_window = True
+            else:
+                if start <= current_hour < end:
+                    in_window = True
+
+            if in_window:
+                # --- Smart Agent's Turn ---
+                obs = np.array([smart_battery.soc, step], dtype=np.float32)
+                action_index, _ = smart_agent.predict(obs)
+
+                if action_index >= len(charger.power_levels):
+                    action_index = charger.power_levels.index(0) if 0 in charger.power_levels else 0
+                
+                power_kw = charger.power_levels[action_index]
+                power_kw = min(power_kw, config['max_charge_speed'])
+
+                results = smart_engine.run_step(power_kw, 0.25, timestamp, smart_cycle_count)
+                
+                # Accumulate daily costs
+                for key, value in results['costs'].items():
+                    daily_smart_costs[key] = daily_smart_costs.get(key, 0) + value
+                
+                if power_kw > 0:
+                    smart_kwh_charged += power_kw * 0.25
+                if smart_kwh_charged >= config['battery_capacity']:
+                    smart_cycle_count += 1
+                    smart_kwh_charged = 0
+
+                # --- Dumb Agent's Turn ---
+                obs = np.array([dumb_battery.soc, step], dtype=np.float32)
+                action_index, _ = dumb_agent.predict(obs, charger, config['soc_target'])
+                
+                power_kw_dumb = charger.power_levels[action_index]
+                power_kw_dumb = min(power_kw_dumb, config['max_charge_speed'])
+
+                results_dumb = dumb_engine.run_step(power_kw_dumb, 0.25, timestamp, dumb_cycle_count)
+
+                for key, value in results_dumb['costs'].items():
+                    daily_dumb_costs[key] = daily_dumb_costs.get(key, 0) + value
+
+                if power_kw_dumb > 0:
+                    dumb_kwh_charged += power_kw_dumb * 0.25
+                if dumb_kwh_charged >= config['battery_capacity']:
+                    dumb_cycle_count += 1
+                    dumb_kwh_charged = 0
             
-            # --- Smart Agent's Turn ---
-            # **FIX: Convert the observation tuple to a NumPy array**
-            obs = np.array([smart_battery.soc, step], dtype=np.float32)
-            action_index, _ = smart_agent.predict(obs)
-
-            if action_index >= len(charger.power_levels):
-                action_index = charger.power_levels.index(0) if 0 in charger.power_levels else 0
+            # Capture the SOC at the moment the window closes
+            if not in_window and smart_soc_end_of_window is None and step > 0:
+                smart_soc_end_of_window = smart_battery.soc
+                dumb_soc_end_of_window = dumb_battery.soc
+        
+        # Log the daily summary
+        if smart_soc_end_of_window is None: # Handle cases where window is 24h
+            smart_soc_end_of_window = smart_battery.soc
+            dumb_soc_end_of_window = dumb_battery.soc
             
-            power_kw = charger.power_levels[action_index]
-            power_kw = min(power_kw, config['max_charge_speed'])
+        logger.log_step(
+            run_id=config['run_id'], 
+            day=day, 
+            agent_type='Smart', 
+            final_soc=smart_soc_end_of_window,
+            final_soh=smart_battery.soh,
+            soc_fulfillment=smart_soc_end_of_window / config['soc_target'],
+            **daily_smart_costs
+        )
+        logger.log_step(
+            run_id=config['run_id'], 
+            day=day, 
+            agent_type='Dumb', 
+            final_soc=dumb_soc_end_of_window,
+            final_soh=dumb_battery.soh,
+            soc_fulfillment=dumb_soc_end_of_window / config['soc_target'],
+            **daily_dumb_costs
+        )
 
-            results = smart_engine.run_step(power_kw, 0.25, timestamp, smart_cycle_count)
-            logger.log_step(
-                run_id=config['run_id'], day=day, agent_type='Smart', 
-                charging_scenario=charger.name, power_kw=power_kw,
-                **results['costs'], **{'soc': results['final_soc'], 'soh': results['final_soh']}
-            )
-            
-            if power_kw > 0:
-                smart_kwh_charged += power_kw * 0.25
-            if smart_kwh_charged >= config['battery_capacity']:
-                smart_cycle_count += 1
-                smart_kwh_charged = 0
-
-            # --- Dumb Agent's Turn ---
-            # **FIX: Convert the observation tuple to a NumPy array**
-            obs = np.array([dumb_battery.soc, step], dtype=np.float32)
-            action_index, _ = dumb_agent.predict(obs, charger)
-            
-            power_kw = charger.power_levels[action_index]
-            power_kw = min(power_kw, config['max_charge_speed'])
-
-            results = dumb_engine.run_step(power_kw, 0.25, timestamp, dumb_cycle_count)
-            logger.log_step(
-                run_id=config['run_id'], day=day, agent_type='Dumb', 
-                charging_scenario=charger.name, power_kw=power_kw,
-                **results['costs'], **{'soc': results['final_soc'], 'soh': results['final_soh']}
-            )
-
-            if power_kw > 0:
-                dumb_kwh_charged += power_kw * 0.25
-            if dumb_kwh_charged >= config['battery_capacity']:
-                dumb_cycle_count += 1
-                dumb_kwh_charged = 0
 
 def main():
     """Main entry point for the CLI application."""
@@ -112,6 +166,7 @@ def main():
     
     config_manager = ConfigManager()
     chargers = config_manager.parse_chargers(raw_args.chargers)
+    scenarios = config_manager.parse_scenarios(raw_args.scenarios)
     
     if not os.path.exists(raw_args.agent_path):
         print(f"Error: Agent file not found at {raw_args.agent_path}")
@@ -133,7 +188,9 @@ def main():
             'battery_capacity': raw_args.battery_capacity,
             'max_charge_speed': raw_args.max_charge_speed,
             'chargers': chargers,
-            'price_path': raw_args.price_path
+            'price_path': raw_args.price_path,
+            'scenarios': scenarios,
+            'soc_target': raw_args.soc_target # **NEW: Add soc_target to config**
         }
         run_simulation_run(config, smart_agent, full_log)
 
