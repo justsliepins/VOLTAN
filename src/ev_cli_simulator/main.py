@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 # Import all our components
 from .cli_parser import parse_args
-from .config_manager import ConfigManager, ChargerConfig, ScenarioConfig
+from .config_manager import ConfigManager, ScenarioConfig, AgentConfig
 from .agent_loader import load_agent
 from .data_logger import DataLogger
 from .core.battery import Battery
@@ -16,61 +16,51 @@ from .core.degradation_model import DegradationModel
 from .core.cost_calculator import CostCalculator
 from .core.simulation_engine import SimulationEngine
 
-# A simple baseline agent for comparison
 class DumbAgent:
-    def predict(self, obs, charger_config: ChargerConfig, target_soc: float, deterministic=True):
+    """A simple baseline agent that charges at max power if below target SOC."""
+    def predict(self, obs, power_levels: list, target_soc: float, deterministic=True):
         soc = obs[0]
-        max_power = max(charger_config.power_levels)
-        max_power_index = charger_config.power_levels.index(max_power)
-        idle_power_index = charger_config.power_levels.index(0) if 0 in charger_config.power_levels else 0
+        max_power = max(power_levels)
+        max_power_index = power_levels.index(max_power)
+        idle_power_index = power_levels.index(0) if 0 in power_levels else 0
         action_index = max_power_index if soc < target_soc else idle_power_index
         return (action_index, None)
 
-def run_simulation_run(config, smart_agent, logger, engine_override=None):
-    """Executes a single, full simulation run from start to finish."""
+def run_simulation_run(config, agents_to_run: dict, logger, engine_override=None):
+    """Executes a single, full simulation run for multiple agents."""
     
-    # These batteries persist for the entire multi-year run
-    smart_battery = Battery(config['battery_capacity'])
-    dumb_battery = Battery(config['battery_capacity'])
+    # Create a separate battery and engine for each agent
+    batteries = {name: Battery(config['battery_capacity']) for name in agents_to_run}
+    engines = {}
     
     latvia_tz = ZoneInfo("Europe/Riga")
 
     if engine_override:
-        smart_engine = dumb_engine = engine_override
+        engines = {name: engine_override for name in agents_to_run}
     else:
         with open(config['price_path'], 'r') as f:
             price_csv_data = f.read()
-        
         price_model = PriceModel(price_csv_data)
         degradation_model = DegradationModel()
         cost_calculator = CostCalculator(price_model, degradation_model)
-        smart_engine = SimulationEngine(smart_battery, cost_calculator, 8000)
-        dumb_engine = SimulationEngine(dumb_battery, cost_calculator, 8000)
+        for name, battery in batteries.items():
+            engines[name] = SimulationEngine(battery, cost_calculator, 8000)
 
-    dumb_agent = DumbAgent()
-    
     num_days = int(config['years'] * 365)
-    
     scenarios = config['scenarios']
     scenario_choices = [s for s in scenarios]
     scenario_probabilities = [s.probability for s in scenarios]
     
-    smart_kwh_charged = 0
-    dumb_kwh_charged = 0
-    smart_cycle_count = 1
-    dumb_cycle_count = 1
+    # Track cycles for each agent
+    kwh_charged = {name: 0 for name in agents_to_run}
+    cycle_counts = {name: 1 for name in agents_to_run}
 
     for day in range(num_days):
-        if not config['chargers']:
-            raise ValueError("Configuration error: At least one charger must be provided.")
-        charger = random.choice(config['chargers'])
-        
         daily_scenario = random.choices(scenario_choices, scenario_probabilities)[0]
         
-        # Simulate daily driving by resetting SOC at the start of each day.
-        start_of_day_soc = 0.3
-        smart_battery.soc = start_of_day_soc
-        dumb_battery.soc = start_of_day_soc
+        # Reset SOC for all batteries at the start of the day
+        for battery in batteries.values():
+            battery.soc = config['start_soc']
         
         daily_log_buffer = []
 
@@ -81,71 +71,51 @@ def run_simulation_run(config, smart_agent, logger, engine_override=None):
             in_window = False
             start, end = daily_scenario.start_hour, daily_scenario.end_hour
             if start > end:
-                if current_hour >= start or current_hour < end:
-                    in_window = True
+                if current_hour >= start or current_hour < end: in_window = True
             else:
-                if start <= current_hour < end:
-                    in_window = True
+                if start <= current_hour < end: in_window = True
 
             if in_window:
-                # --- Smart Agent's Turn ---
-                obs = np.array([smart_battery.soc, step], dtype=np.float32)
-                action_index, _ = smart_agent.predict(obs)
+                # Loop through each agent and simulate its step
+                for name, agent in agents_to_run.items():
+                    battery = batteries[name]
+                    engine = engines[name]
+                    
+                    obs = np.array([battery.soc, step], dtype=np.float32)
+                    
+                    if isinstance(agent, DumbAgent):
+                        action_index, _ = agent.predict(obs, config['charger_power_levels'], config['soc_target'])
+                    else: # Smart Agent
+                        action_index, _ = agent.predict(obs)
 
-                if action_index >= len(charger.power_levels):
-                    action_index = charger.power_levels.index(0) if 0 in charger.power_levels else 0
-                
-                power_kw = charger.power_levels[action_index]
-                power_kw = min(power_kw, config['max_charge_speed'])
+                    if action_index >= len(config['charger_power_levels']):
+                        action_index = config['charger_power_levels'].index(0) if 0 in config['charger_power_levels'] else 0
+                    
+                    power_kw = config['charger_power_levels'][action_index]
+                    power_kw = min(power_kw, config['max_charge_speed'])
 
-                results = smart_engine.run_step(power_kw, 0.25, timestamp, smart_cycle_count)
-                
-                daily_log_buffer.append({
-                    'agent_type': 'Smart', 'timestamp': timestamp,
-                    'charging_scenario': daily_scenario.name, 'power_kw': power_kw,
-                    **results['costs'], 'soc': results['final_soc'], 'soh': results['final_soh']
-                })
-                
-                if power_kw > 0:
-                    smart_kwh_charged += power_kw * 0.25
-                if smart_kwh_charged >= config['battery_capacity']:
-                    smart_cycle_count += 1
-                    smart_kwh_charged = 0
-
-                # --- Dumb Agent's Turn ---
-                obs = np.array([dumb_battery.soc, step], dtype=np.float32)
-                action_index, _ = dumb_agent.predict(obs, charger, config['soc_target'])
-                
-                power_kw_dumb = charger.power_levels[action_index]
-                power_kw_dumb = min(power_kw_dumb, config['max_charge_speed'])
-
-                results_dumb = dumb_engine.run_step(power_kw_dumb, 0.25, timestamp, dumb_cycle_count)
-
-                daily_log_buffer.append({
-                    'agent_type': 'Dumb', 'timestamp': timestamp,
-                    'charging_scenario': daily_scenario.name, 'power_kw': power_kw_dumb,
-                    **results_dumb['costs'], 'soc': results_dumb['final_soc'], 'soh': results_dumb['final_soh']
-                })
-
-                if power_kw_dumb > 0:
-                    dumb_kwh_charged += power_kw_dumb * 0.25
-                if dumb_kwh_charged >= config['battery_capacity']:
-                    dumb_cycle_count += 1
-                    dumb_kwh_charged = 0
+                    results = engine.run_step(power_kw, 0.25, timestamp, cycle_counts[name])
+                    
+                    daily_log_buffer.append({
+                        'agent_type': name, 'timestamp': timestamp,
+                        'charging_scenario': daily_scenario.name, 'power_kw': power_kw,
+                        **results['costs'], 'soc': results['final_soc'], 'soh': results['final_soh']
+                    })
+                    
+                    if power_kw > 0:
+                        kwh_charged[name] += power_kw * 0.25
+                    if kwh_charged[name] >= config['battery_capacity']:
+                        cycle_counts[name] += 1
+                        kwh_charged[name] = 0
         
-        smart_soc_end_of_day = smart_battery.soc
-        dumb_soc_end_of_day = dumb_battery.soc
-        
-        smart_fulfillment = smart_soc_end_of_day / config['soc_target']
-        dumb_fulfillment = dumb_soc_end_of_day / config['soc_target']
-
+        # After the day, calculate fulfillment and log all buffered steps
         for entry in daily_log_buffer:
-            fulfillment = smart_fulfillment if entry['agent_type'] == 'Smart' else dumb_fulfillment
+            agent_name = entry['agent_type']
+            final_soc_for_day = batteries[agent_name].soc
+            fulfillment = final_soc_for_day / config['soc_target']
             logger.log_step(
-                run_id=config['run_id'],
-                day=day,
-                soc_fulfillment=fulfillment,
-                **entry
+                run_id=config['run_id'], day=day,
+                soc_fulfillment=fulfillment, **entry
             )
 
 def main():
@@ -153,19 +123,25 @@ def main():
     raw_args = parse_args()
     
     config_manager = ConfigManager()
-    chargers = config_manager.parse_chargers(raw_args.chargers)
+    power_levels = config_manager.parse_charger_power_levels(raw_args.charger_power_levels)
     scenarios = config_manager.parse_scenarios(raw_args.scenarios)
+    agent_configs = config_manager.parse_agents(raw_args.agents)
     
-    if not os.path.exists(raw_args.agent_path):
-        print(f"Error: Agent file not found at {raw_args.agent_path}")
-        return
-
+    # Load all agents into a dictionary
+    agents_to_run = {}
+    for agent_config in agent_configs:
+        if agent_config.path == 'baseline':
+            agents_to_run[agent_config.name] = DumbAgent()
+        else:
+            if not os.path.exists(agent_config.path):
+                print(f"Error: Agent file not found at {agent_config.path}")
+                return
+            agents_to_run[agent_config.name] = load_agent(agent_config.path)
+            
     if not hasattr(raw_args, 'price_path') or not os.path.exists(raw_args.price_path):
         print(f"Error: Price data file not found. Please provide a valid path using --price-path.")
         return
 
-    smart_agent = load_agent(raw_args.agent_path)
-    
     full_log = DataLogger()
 
     for i in range(raw_args.runs):
@@ -174,10 +150,13 @@ def main():
             'run_id': i + 1, 'years': raw_args.years,
             'battery_capacity': raw_args.battery_capacity,
             'max_charge_speed': raw_args.max_charge_speed,
-            'chargers': chargers, 'price_path': raw_args.price_path,
-            'scenarios': scenarios, 'soc_target': raw_args.soc_target
+            'start_soc': raw_args.start_soc,
+            'soc_target': raw_args.soc_target,
+            'charger_power_levels': power_levels,
+            'price_path': raw_args.price_path,
+            'scenarios': scenarios
         }
-        run_simulation_run(config, smart_agent, full_log)
+        run_simulation_run(config, agents_to_run, full_log)
 
     print("\n--- All simulations complete ---")
     
