@@ -33,3 +33,13 @@ def test_battery_initialization_with_soh():
     battery2 = Battery(capacity_kwh=77.0, initial_soh=0.9)
     assert battery2.soh == 0.9
 
+def test_degrade_soh():
+    """Tests if the SOH degrades correctly and clamps at 0.0."""
+    battery = Battery(capacity_kwh=77.0, initial_soh=1.0)
+
+    battery.degrade(soh_loss=0.01)
+    assert battery.soh == pytest.approx(0.99)
+
+    battery.soh = 0.05 # Manually set for test case
+    battery.degrade(soh_loss=0.1)
+    assert battery.soh == 0.0

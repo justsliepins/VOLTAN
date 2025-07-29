@@ -29,3 +29,11 @@ class Battery:
         soc_delta = energy_kwh / self.capacity_kwh
         new_soc = self.soc + soc_delta
         self.soc = max(0.0, min(1.0, new_soc))
+
+    def degrade(self, soh_loss: float):
+        """
+        Reduces the battery's SOH by a given amount.
+
+        The final SOH is clamped at 0.0.
+        """
+        self.soh = max(0.0, self.soh - soh_loss)
