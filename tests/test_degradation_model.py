@@ -17,3 +17,21 @@ def test_get_sei_cost():
     # ... rest of the test remains the same
     cost_at_cycle_200 = model.get_sei_cost(cycle_number=200)
     assert cost_at_cycle_200 == pytest.approx(0.457, abs=1e-3)
+
+def test_get_calendar_ageing_cost():
+    """
+    Tests if calendar ageing cost is calculated correctly using
+    piecewise linear interpolation based on SOC.
+    """
+    model = DegradationModel() # Using default SEI params, which is fine
+
+    # Test interpolation between 50% and 100% SOC
+    soc = 0.75  # 75%
+    duration_h = 2.0
+    
+    # Expected cost is based on derived hourly rates from research data
+    expected_cost = 0.296
+    
+    actual_cost = model.get_calendar_ageing_cost(soc=soc, duration_h=duration_h)
+    
+    assert actual_cost == pytest.approx(expected_cost, abs=1e-3)
